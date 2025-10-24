@@ -1,150 +1,92 @@
-volumes:
-  n8n_storage:
-  postgres_storage:
-  ollama_storage:
-  qdrant_storage:
-
-networks:
-  demo:
-
-x-n8n: &service-n8n
-  image: n8nio/n8n:latest
-  networks: ['demo']
-  environment:
-    - DB_TYPE=postgresdb
-    - DB_POSTGRESDB_HOST=postgres
-    - DB_POSTGRESDB_USER=${POSTGRES_USER}
-    - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
-    - N8N_DIAGNOSTICS_ENABLED=false
-    - N8N_PERSONALIZATION_ENABLED=false
-    - N8N_ENCRYPTION_KEY
-    - N8N_USER_MANAGEMENT_JWT_SECRET
-    - OLLAMA_HOST=${OLLAMA_HOST:-ollama:11434}
-  env_file:
-    - path: .env
-      required: true
-
-x-ollama: &service-ollama
-  image: ollama/ollama:latest
-  container_name: ollama
-  networks: ['demo']
-  restart: unless-stopped
-  ports:
-    - 11434:11434
-  volumes:
-    - ollama_storage:/root/.ollama
-
-x-init-ollama: &init-ollama
-  image: ollama/ollama:latest
-  networks: ['demo']
-  container_name: ollama-pull-llama
-  volumes:
-    - ollama_storage:/root/.ollama
-  entrypoint: /bin/sh
-  environment:
-    - OLLAMA_HOST=ollama:11434
-  command:
-    - "-c"
-    - "sleep 3; ollama pull llama3.2"
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    hostname: postgres
-    networks: ['demo']
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER
-      - POSTGRES_PASSWORD
-      - POSTGRES_DB
-    volumes:
-      - postgres_storage:/var/lib/postgresql/data
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  n8n-import:
-    <<: *service-n8n
-    hostname: n8n-import
-    container_name: n8n-import
-    entrypoint: /bin/sh
-    command:
-      - "-c"
-      - "n8n import:credentials --separate --input=/demo-data/credentials && n8n import:workflow --separate --input=/demo-data/workflows"
-    volumes:
-      - ./n8n/demo-data:/demo-data
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   n8n:
-    <<: *service-n8n
-    hostname: n8n
+    build:
+      context: .
+      dockerfile: Dockerfile.n8n
     container_name: n8n
     restart: unless-stopped
     ports:
-      - 5678:5678
+      - "5678:5678"
     volumes:
       - n8n_storage:/home/node/.n8n
-      - ./n8n/demo-data:/demo-data
-      - ./shared:/data/shared
+      - ${DJANGO_PROJECT_PATH}:/django_project
+    environment:
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - NODE_FUNCTION_ALLOW_EXTERNAL=n8n-nodes-sqlite
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+      # --- Es buena práctica definir explícitamente la DB ---
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=n8n
+      # --- Opcional: Clave API para Qdrant (ver servicio qdrant) ---
+      # - N8N_CRED_QDRANT_API_DEFAULT_TYPE=qdrantApi
+      # - N8N_CRED_QDRANT_API_DEFAULT_NAME=My Qdrant
+      # - N8N_CRED_QDRANT_API_DEFAULT_DATA_apiKey=my_secret_key
+      # - N8N_CRED_QDRANT_API_DEFAULT_DATA_url=http://qdrant:6333
     depends_on:
-      postgres:
-        condition: service_healthy
-      n8n-import:
-        condition: service_completed_successfully
+      - postgres
+      - qdrant  # <-- Añadido
+      - ollama  # <-- Añadido
+
+  n8n-import:
+    image: n8nio/n8n:latest
+    container_name: n8n-import
+    environment:
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+    volumes:
+      - n8n_storage:/home/node/.n8n
+    command: ["n8n", "import:workflow", "--separate-tasks"]
+    depends_on: # <-- Buena práctica añadir esto
+      - n8n
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: n8n
+      POSTGRES_DB: n8n
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # --- NUEVOS SERVICIOS AÑADIDOS ---
 
   qdrant:
-    image: qdrant/qdrant
-    hostname: qdrant
+    image: qdrant/qdrant:latest
     container_name: qdrant
-    networks: ['demo']
     restart: unless-stopped
     ports:
-      - 6333:6333
+      - "6333:6333" # Puerto API REST
+      - "6334:6334" # Puerto gRPC
     volumes:
       - qdrant_storage:/qdrant/storage
+    # Opcional: Descomenta esto si quieres usar una API Key
+    # environment:
+    #   - QDRANT__SERVICE__API_KEY=my_secret_key
 
-  ollama-cpu:
-    profiles: ["cpu"]
-    <<: *service-ollama
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    # Opcional: Descomenta el bloque 'deploy' si tienes una GPU NVIDIA
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
 
-  ollama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *service-ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  ollama-gpu-amd:
-    profiles: ["gpu-amd"]
-    <<: *service-ollama
-    image: ollama/ollama:rocm
-    devices:
-      - "/dev/kfd"
-      - "/dev/dri"
-
-  ollama-pull-llama-cpu:
-    profiles: ["cpu"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-cpu
-
-  ollama-pull-llama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-gpu
-
-  ollama-pull-llama-gpu-amd:
-    profiles: [gpu-amd]
-    <<: *init-ollama
-    image: ollama/ollama:rocm
-    depends_on:
-     - ollama-gpu-amd
+volumes:
+  n8n_storage:
+  postgres_data:
+  qdrant_storage: # <-- Añadido
+  ollama_storage: # <-- Añadido

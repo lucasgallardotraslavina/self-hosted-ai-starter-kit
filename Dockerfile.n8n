@@ -1,0 +1,11 @@
+FROM n8nio/n8n:latest
+
+# Copia package.json al contenedor
+COPY package.json /home/node/package.json
+WORKDIR /home/node
+
+# Instala dependencias localmente
+RUN npm install --unsafe-perm
+
+# Usa el usuario node
+USER node
